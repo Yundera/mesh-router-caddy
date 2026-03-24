@@ -1,0 +1,50 @@
+# =============================================================================
+# CADDY CONFIGURATION - Mesh Router Template
+# =============================================================================
+# Container routing is handled via Docker labels (caddy-docker-proxy)
+# This file defines global config and reusable snippets only
+# =============================================================================
+
+{
+    log {
+        output stdout
+        format console
+    }
+
+    # Let's Encrypt email for certificate registration (used for sslip.io domains)
+    email {$PCS_EMAIL}
+}
+
+# Custom CA TLS for gateway-routed and nip.io domains
+# Gateway trusts this CA, so no LE needed for these routes
+# nip.io domains also use this custom CA for consistency
+(gateway_tls) {
+    # Restore original host when request comes through CF worker
+    # The CF worker rewrites Host to nip.io for routing, but preserves
+    # the original nsl.sh domain in X-Original-Host. Restoring it ensures
+    # apps generate correct redirect URLs and cookie domains.
+    @has_original_host header X-Original-Host *
+    request_header @has_original_host Host {http.request.header.X-Original-Host}
+    tls /certs/cert.pem /certs/key.pem
+}
+
+# =============================================================================
+# ROOT DOMAIN ROUTING - Configurable default service
+# =============================================================================
+
+# Root domain via gateway (custom CA)
+{$DOMAIN} {
+    import gateway_tls
+    reverse_proxy {$DEFAULT_SERVICE_HOST}:{$DEFAULT_SERVICE_PORT}
+}
+
+# Root domain via nip.io (custom CA)
+{$PUBLIC_IP_DASH}.nip.io {
+    import gateway_tls
+    reverse_proxy {$DEFAULT_SERVICE_HOST}:{$DEFAULT_SERVICE_PORT}
+}
+
+# Root domain via sslip.io (Let's Encrypt)
+{$PUBLIC_IP_DASH}.sslip.io {
+    reverse_proxy {$DEFAULT_SERVICE_HOST}:{$DEFAULT_SERVICE_PORT}
+}
