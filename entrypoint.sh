@@ -11,6 +11,8 @@ CATCHALL_ENABLED="${CATCHALL_ENABLED:-true}"
 CATCHALL_TARGET_HOST="${DEFAULT_SERVICE_HOST:-casaos}"
 CATCHALL_TARGET_PORT="${DEFAULT_SERVICE_PORT:-8080}"
 CATCHALL_CHECK_INTERVAL="${CATCHALL_CHECK_INTERVAL:-5}"
+CATCHALL_ASK_ENDPOINT="${CATCHALL_ASK_ENDPOINT:-http://localhost:5555/ask}"
+CADDY_STARTUP_TIMEOUT="${CADDY_STARTUP_TIMEOUT:-60}"
 
 reload_certs() {
     echo "[watcher] Certificate change detected, reloading..."
@@ -37,8 +39,14 @@ reload_caddyfile() {
 
 wait_for_caddy() {
     echo "[watcher] Waiting for Caddy admin API..."
-    while ! curl -s "http://${CADDY_ADMIN}/config/" > /dev/null 2>&1; do
+    local elapsed=0
+    while ! curl -sf "http://${CADDY_ADMIN}/config/" > /dev/null 2>&1; do
         sleep 1
+        elapsed=$((elapsed + 1))
+        if [ "$elapsed" -ge "$CADDY_STARTUP_TIMEOUT" ]; then
+            echo "[watcher] ERROR: Caddy admin API not ready after ${CADDY_STARTUP_TIMEOUT}s, giving up"
+            return 1
+        fi
     done
     echo "[watcher] Caddy admin API ready"
 }
@@ -53,55 +61,103 @@ wait_for_caddy() {
 # =============================================================================
 
 has_catchall_tls_policy() {
-    # Check if an on_demand TLS policy with internal issuer exists
-    curl -s "http://${CADDY_ADMIN}/config/apps/tls/automation/policies" 2>/dev/null | \
-        grep -q '"on_demand":true' 2>/dev/null
+    # Check both: per-policy on_demand flag AND global on_demand permission config
+    curl -sf "http://${CADDY_ADMIN}/config/apps/tls/automation/policies" 2>/dev/null | \
+        grep -q '"on_demand"' || return 1
+    curl -sf "http://${CADDY_ADMIN}/config/apps/tls/automation/on_demand" 2>/dev/null | \
+        grep -q '"permission"' || return 1
 }
 
 has_catchall_route() {
-    # Check if the last route has no host matcher (catch-all)
-    # A route without "match" or with empty match is a catch-all
-    local last_route
-    last_route=$(curl -s "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes" 2>/dev/null | \
-        sed 's/.*\(\[{[^]]*}\]\)$/\1/' | \
-        grep -o '\[{[^]]*}\]$' 2>/dev/null || echo "")
+    # Check for our tagged catch-all route via the X-Mesh-Catchall marker
+    curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes" 2>/dev/null | \
+        grep -q 'X-Mesh-Catchall'
+}
 
-    # If the last route doesn't have a "match" field with "host", it's a catch-all
-    if echo "$last_route" | grep -q '"match"' 2>/dev/null; then
-        return 1  # Has match clause, not a catch-all
-    fi
-    return 0  # No match clause, is a catch-all
+find_catchall_route_index() {
+    # Iterate routes by index to find the one tagged with our marker
+    local i=0
+    while true; do
+        local route
+        route=$(curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes/${i}" 2>/dev/null) || return 1
+        if echo "$route" | grep -q 'X-Mesh-Catchall'; then
+            echo "$i"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+}
+
+remove_catchall_route() {
+    # Remove existing tagged catch-all route (safety net against duplicates)
+    local idx
+    idx=$(find_catchall_route_index) || return 0
+    echo "[catchall] Removing stale catch-all route at index ${idx}..."
+    curl -sf -X DELETE "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes/${idx}" 2>/dev/null || true
 }
 
 inject_catchall_tls_policy() {
-    echo "[catchall] Injecting on_demand TLS policy..."
-    curl -s -X POST "http://${CADDY_ADMIN}/config/apps/tls/automation/policies" \
+    echo "[catchall] Enabling on_demand TLS..."
+
+    # Step 1: Set global on_demand permission config (required by Caddy v2.10+)
+    # This goes at tls.automation.on_demand, separate from per-policy config.
+    # Use DELETE+PUT to handle both fresh and existing state (PUT fails with 409 if key exists).
+    curl -sf -X DELETE "http://${CADDY_ADMIN}/config/apps/tls/automation/on_demand" 2>/dev/null || true
+    curl -sf -X PUT "http://${CADDY_ADMIN}/config/apps/tls/automation/on_demand" \
         -H "Content-Type: application/json" \
-        -d '{"on_demand": true, "issuers": [{"module": "internal"}]}' || true
-    echo "[catchall] TLS policy injected"
+        -d "{
+            \"permission\": {
+                \"module\": \"http\",
+                \"endpoint\": \"${CATCHALL_ASK_ENDPOINT}\"
+            }
+        }" || echo "[catchall] WARN: Failed to set on_demand permission"
+
+    # Step 2: Enable on_demand flag on the existing catch-all policy (index 0)
+    curl -sf -X DELETE "http://${CADDY_ADMIN}/config/apps/tls/automation/policies/0/on_demand" 2>/dev/null || true
+    curl -sf -X PUT "http://${CADDY_ADMIN}/config/apps/tls/automation/policies/0/on_demand" \
+        -H "Content-Type: application/json" \
+        -d 'true' \
+        || echo "[catchall] WARN: Failed to enable on_demand on policy"
+
+    echo "[catchall] TLS on_demand enabled"
 }
 
 inject_catchall_route() {
     echo "[catchall] Injecting catch-all HTTP route to ${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}..."
-    curl -s -X POST "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes" \
+    curl -sf -X POST "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes" \
         -H "Content-Type: application/json" \
         -d "{
             \"handle\": [{
                 \"handler\": \"subroute\",
                 \"routes\": [{
-                    \"handle\": [{
-                        \"handler\": \"reverse_proxy\",
-                        \"upstreams\": [{\"dial\": \"${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}\"}]
-                    }]
+                    \"handle\": [
+                        {
+                            \"handler\": \"headers\",
+                            \"response\": {
+                                \"set\": {
+                                    \"X-Mesh-Catchall\": [\"true\"]
+                                }
+                            }
+                        },
+                        {
+                            \"handler\": \"reverse_proxy\",
+                            \"upstreams\": [{\"dial\": \"${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}\"}]
+                        }
+                    ]
                 }]
             }],
             \"terminal\": true
-        }" || true
+        }" || echo "[catchall] WARN: Failed to inject catch-all route"
     echo "[catchall] HTTP route injected"
 }
 
 ensure_catchall_config() {
     if [ "$CATCHALL_ENABLED" != "true" ]; then
+        return
+    fi
+
+    # Wait for srv0 to exist (caddy-docker-proxy creates it)
+    if ! curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0" > /dev/null 2>&1; then
         return
     fi
 
@@ -113,6 +169,7 @@ ensure_catchall_config() {
     fi
 
     if ! has_catchall_route; then
+        remove_catchall_route
         inject_catchall_route
         injected=true
     fi
