@@ -11,7 +11,6 @@ CATCHALL_ENABLED="${CATCHALL_ENABLED:-true}"
 CATCHALL_TARGET_HOST="${DEFAULT_SERVICE_HOST:-casaos}"
 CATCHALL_TARGET_PORT="${DEFAULT_SERVICE_PORT:-8080}"
 CATCHALL_CHECK_INTERVAL="${CATCHALL_CHECK_INTERVAL:-5}"
-CATCHALL_ASK_ENDPOINT="${CATCHALL_ASK_ENDPOINT:-http://localhost:5555/ask}"
 CADDY_STARTUP_TIMEOUT="${CADDY_STARTUP_TIMEOUT:-60}"
 
 reload_certs() {
@@ -54,18 +53,23 @@ wait_for_caddy() {
 # =============================================================================
 # CATCH-ALL INJECTION
 # =============================================================================
-# caddy-docker-proxy drops the :443 catch-all block from Caddyfile during
-# config regeneration. We inject equivalent config via Admin API:
-#   1. TLS automation policy with on_demand + internal issuer
-#   2. Catch-all HTTP route (no host matcher, appended last)
+# caddy-docker-proxy drops catch-all config during Caddyfile regeneration.
+# We re-inject via Admin API every CATCHALL_CHECK_INTERVAL seconds:
+#   1. TLS connection policy: set cert0 on the catch-all (no SNI match) policy
+#      so unknown domains get the custom CA cert (Cloudflare Full mode)
+#   2. HTTP route: append a catch-all route (no host matcher) with
+#      X-Mesh-Catchall marker header for reliable detection
 # =============================================================================
 
-has_catchall_tls_policy() {
-    # Check both: per-policy on_demand flag AND global on_demand permission config
-    curl -sf "http://${CADDY_ADMIN}/config/apps/tls/automation/policies" 2>/dev/null | \
-        grep -q '"on_demand"' || return 1
-    curl -sf "http://${CADDY_ADMIN}/config/apps/tls/automation/on_demand" 2>/dev/null | \
-        grep -q '"permission"' || return 1
+has_catchall_tls_conn_policy() {
+    # Check if the catch-all TLS connection policy (no SNI match) has cert0 selected.
+    # Without this, unknown SNI values get an empty {} policy and TLS handshake fails.
+    # Must check the specific catch-all policy, not just any policy in the array.
+    local idx
+    idx=$(find_catchall_tls_conn_policy_index) || return 1
+    local policy
+    policy=$(curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies/${idx}" 2>/dev/null) || return 1
+    echo "$policy" | grep -q '"any_tag"' || return 1
 }
 
 has_catchall_route() {
@@ -96,30 +100,43 @@ remove_catchall_route() {
     curl -sf -X DELETE "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes/${idx}" 2>/dev/null || true
 }
 
-inject_catchall_tls_policy() {
-    echo "[catchall] Enabling on_demand TLS..."
+find_catchall_tls_conn_policy_index() {
+    # Find the TLS connection policy without an SNI match (the catch-all).
+    # Iterate policies; the one without "match" or with empty match is the catch-all.
+    local i=0
+    while true; do
+        local policy
+        policy=$(curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies/${i}" 2>/dev/null) || return 1
+        # A catch-all policy has no "match" field (or match is absent)
+        if ! echo "$policy" | grep -q '"match"'; then
+            echo "$i"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+}
 
-    # Step 1: Set global on_demand permission config (required by Caddy v2.10+)
-    # This goes at tls.automation.on_demand, separate from per-policy config.
-    # Use DELETE+PUT to handle both fresh and existing state (PUT fails with 409 if key exists).
-    curl -sf -X DELETE "http://${CADDY_ADMIN}/config/apps/tls/automation/on_demand" 2>/dev/null || true
-    curl -sf -X PUT "http://${CADDY_ADMIN}/config/apps/tls/automation/on_demand" \
+inject_catchall_tls_conn_policy() {
+    # Patch the catch-all TLS connection policy to use cert0 (custom CA cert).
+    # Custom domains come through Cloudflare which uses "Full" mode — it doesn't
+    # verify SAN/CN, just needs a valid TLS handshake. Using cert0 avoids ACME
+    # challenges which fail behind Cloudflare's proxy.
+    echo "[catchall] Patching catch-all TLS connection policy with cert0..."
+
+    local idx
+    idx=$(find_catchall_tls_conn_policy_index)
+    if [ -z "$idx" ]; then
+        echo "[catchall] WARN: No catch-all TLS connection policy found"
+        return
+    fi
+
+    # Replace the empty {} policy with one that selects cert0
+    curl -sf -X PUT "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies/${idx}" \
         -H "Content-Type: application/json" \
-        -d "{
-            \"permission\": {
-                \"module\": \"http\",
-                \"endpoint\": \"${CATCHALL_ASK_ENDPOINT}\"
-            }
-        }" || echo "[catchall] WARN: Failed to set on_demand permission"
+        -d '{"certificate_selection": {"any_tag": ["cert0"]}}' \
+        || echo "[catchall] WARN: Failed to patch TLS connection policy"
 
-    # Step 2: Enable on_demand flag on the existing catch-all policy (index 0)
-    curl -sf -X DELETE "http://${CADDY_ADMIN}/config/apps/tls/automation/policies/0/on_demand" 2>/dev/null || true
-    curl -sf -X PUT "http://${CADDY_ADMIN}/config/apps/tls/automation/policies/0/on_demand" \
-        -H "Content-Type: application/json" \
-        -d 'true' \
-        || echo "[catchall] WARN: Failed to enable on_demand on policy"
-
-    echo "[catchall] TLS on_demand enabled"
+    echo "[catchall] TLS connection policy patched (index ${idx} → cert0)"
 }
 
 inject_catchall_route() {
@@ -163,8 +180,8 @@ ensure_catchall_config() {
 
     local injected=false
 
-    if ! has_catchall_tls_policy; then
-        inject_catchall_tls_policy
+    if ! has_catchall_tls_conn_policy; then
+        inject_catchall_tls_conn_policy
         injected=true
     fi
 
