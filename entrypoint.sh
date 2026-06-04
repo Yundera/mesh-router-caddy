@@ -57,7 +57,10 @@ wait_for_caddy() {
 # We re-inject via Admin API every CATCHALL_CHECK_INTERVAL seconds:
 #   1. TLS connection policy: set cert0 on the catch-all (no SNI match) policy
 #      so unknown domains get the custom CA cert (Cloudflare Full mode)
-#   2. HTTP route: append a catch-all route (no host matcher) with
+#   2. *.sslip.io passthrough TLS policy ordered before the catch-all, so sslip
+#      hosts serve their Let's Encrypt cert instead of cert0 (see
+#      inject_sslip_passthrough_policy for the full rationale)
+#   3. HTTP route: append a catch-all route (no host matcher) with
 #      X-Mesh-Catchall marker header for reliable detection
 # =============================================================================
 
@@ -70,6 +73,15 @@ has_catchall_tls_conn_policy() {
     local policy
     policy=$(curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies/${idx}" 2>/dev/null) || return 1
     echo "$policy" | grep -q '"any_tag"' || return 1
+}
+
+has_sslip_passthrough_policy() {
+    # True if a connection policy explicitly matches *.sslip.io. That policy uses
+    # default (unrestricted) certificate selection so sslip hosts serve their
+    # Let's Encrypt cert, instead of being captured by the cert0 catch-all (which
+    # restricts selection to the gateway CA cert).
+    curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies" 2>/dev/null \
+        | grep -qF '*.sslip.io'
 }
 
 has_catchall_route() {
@@ -139,6 +151,39 @@ inject_catchall_tls_conn_policy() {
     echo "[catchall] TLS connection policy patched (index ${idx} → cert0)"
 }
 
+inject_sslip_passthrough_policy() {
+    # Insert a connection policy that matches *.sslip.io with DEFAULT certificate
+    # selection, ordered immediately before the cert0 catch-all.
+    #
+    # Why this is needed: the cert0 catch-all uses `any_tag: cert0`, which
+    # restricts the eligible cert pool to the gateway CA cert. Any *.sslip.io SNI
+    # that falls through to it is served the gateway CA even when its publicly
+    # trusted Let's Encrypt cert is loaded — so the sslip cert never appears to
+    # external clients (and the orchestrator's TLS-validating sslip health check
+    # reports UNABLE_TO_VERIFY_LEAF_SIGNATURE). A policy with no
+    # certificate_selection lets Caddy pick the SNI-matching managed (LE) cert.
+    #
+    # `*.sslip.io` is a single-label wildcard, so one static policy covers both
+    # <app>-<ip>.sslip.io and the bare <ip>.sslip.io without enumerating hosts.
+    # Inserting at the catch-all's index (PUT inserts, shifting it down) keeps the
+    # sslip policy ahead of the catch-all so it wins for sslip SNIs.
+    if has_sslip_passthrough_policy; then
+        return
+    fi
+    local idx
+    idx=$(find_catchall_tls_conn_policy_index)
+    if [ -z "$idx" ]; then
+        echo "[catchall] WARN: catch-all TLS policy not present yet; deferring sslip passthrough"
+        return
+    fi
+    echo "[catchall] Inserting *.sslip.io passthrough TLS policy at index ${idx} (before catch-all)..."
+    curl -sf -X PUT "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies/${idx}" \
+        -H "Content-Type: application/json" \
+        -d '{"match": {"sni": ["*.sslip.io"]}}' \
+        || echo "[catchall] WARN: Failed to insert sslip passthrough policy"
+    echo "[catchall] sslip passthrough policy inserted"
+}
+
 inject_catchall_route() {
     echo "[catchall] Injecting catch-all HTTP route to ${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}..."
     curl -sf -X POST "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes" \
@@ -182,6 +227,13 @@ ensure_catchall_config() {
 
     if ! has_catchall_tls_conn_policy; then
         inject_catchall_tls_conn_policy
+        injected=true
+    fi
+
+    # Must run after the cert0 catch-all exists: this inserts the *.sslip.io
+    # passthrough policy immediately before it so sslip hosts serve their LE cert.
+    if ! has_sslip_passthrough_policy; then
+        inject_sslip_passthrough_policy
         injected=true
     fi
 
