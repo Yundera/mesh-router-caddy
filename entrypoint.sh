@@ -136,7 +136,12 @@ inject_catchall_tls_conn_policy() {
     echo "[catchall] Patching catch-all TLS connection policy with cert0..."
 
     local idx
-    idx=$(find_catchall_tls_conn_policy_index)
+    # `|| idx=""` is load-bearing: find_catchall_tls_conn_policy_index returns 1
+    # whenever no match-less policy exists yet, which is a NORMAL state while
+    # caddy-docker-proxy is mid-regeneration. Under `set -e` a bare failing
+    # assignment aborts the shell immediately, so the guard below never runs and
+    # the watcher dies for good. See start_catchall_watcher for the full history.
+    idx=$(find_catchall_tls_conn_policy_index) || idx=""
     if [ -z "$idx" ]; then
         echo "[catchall] WARN: No catch-all TLS connection policy found"
         return
@@ -171,7 +176,9 @@ inject_sslip_passthrough_policy() {
         return
     fi
     local idx
-    idx=$(find_catchall_tls_conn_policy_index)
+    # Same errexit trap as in inject_catchall_tls_conn_policy: without `|| idx=""`
+    # a legitimate "not found" return kills the watcher instead of deferring.
+    idx=$(find_catchall_tls_conn_policy_index) || idx=""
     if [ -z "$idx" ]; then
         echo "[catchall] WARN: catch-all TLS policy not present yet; deferring sslip passthrough"
         return
@@ -257,13 +264,29 @@ start_catchall_watcher() {
     echo "[catchall] Starting catch-all config watcher (interval: ${CATCHALL_CHECK_INTERVAL}s)..."
     echo "[catchall] Target: ${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}"
 
+    # This watcher is the ONLY thing that restores custom-domain routing after a
+    # caddy-docker-proxy regeneration, so it must not be able to exit. It runs in
+    # its own subshell (see the `&` dispatch at the bottom of this file), so
+    # clearing errexit is local to the watcher and leaves the startup path's
+    # fail-fast behaviour untouched.
+    #
+    # History: with errexit active, one unguarded `idx=$(...)` returning non-zero
+    # killed this loop outright. caddy-docker-proxy then dropped the catch-all on
+    # the next regeneration with nothing left to re-inject it, and every custom
+    # domain on the box failed its TLS handshake (alert 80 -> Cloudflare 525)
+    # until someone restarted the container by hand. *.nsl.sh / *.nip.io /
+    # *.sslip.io kept working throughout, so the outage was invisible on any box
+    # without a custom domain. Guarding the two assignments fixes that specific
+    # path; `set +e` makes the whole loop non-fatal by construction.
+    set +e
+
     # Initial injection
-    ensure_catchall_config
+    ensure_catchall_config || true
 
     # Polling loop to re-inject after caddy-docker-proxy reloads
     while true; do
         sleep "$CATCHALL_CHECK_INTERVAL"
-        ensure_catchall_config
+        ensure_catchall_config || true
     done
 }
 
