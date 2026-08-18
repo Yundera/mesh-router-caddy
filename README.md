@@ -5,7 +5,7 @@ A custom Caddy Docker image extending [caddy-docker-proxy](https://github.com/lu
 ## Features
 
 - **Auto-reload certificates**: Watches certificate files and reloads Caddy when they change
-- **Auto-reload Caddyfile**: Watches Caddyfile and reloads Caddy when it changes
+- **Auto-reload Caddyfile**: handled by caddy-docker-proxy itself — it re-reads the base Caddyfile on every generation (`--polling-interval`, default 30s, plus docker events) and merges it with the label routes. This image adds no Caddyfile watcher: a `caddy reload` of the base file would drop every label-derived route until the next generation. **Bind-mount the Caddyfile's DIRECTORY, not the file** — a single-file mount is pinned to its inode, so a writer that renames a new file into place is never seen.
 - **Catch-all custom domains**: Auto-injects on_demand TLS policy for unknown domains
 - **Zero-downtime**: Uses Caddy admin API for graceful reloads
 - **Docker label routing**: Inherits all caddy-docker-proxy features
@@ -21,7 +21,8 @@ services:
       - "443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # A DIRECTORY, not the file itself — see "Auto-reload Caddyfile" above.
+      - ./caddy:/etc/caddy:ro
       - certs:/certs:ro
     environment:
       - CADDY_DOCKER_CADDYFILE_PATH=/etc/caddy/Caddyfile
@@ -33,7 +34,6 @@ services:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CERT_PATH` | `/certs/cert.pem` | Path to certificate file to watch |
-| `CADDYFILE_PATH` | `/etc/caddy/Caddyfile` | Path to Caddyfile to watch |
 | `CADDY_ADMIN` | `localhost:2019` | Caddy admin API address |
 | `CATCHALL_ENABLED` | `true` | Enable catch-all domain injection |
 | `DEFAULT_SERVICE_HOST` | `casaos` | Target host for catch-all route |
@@ -46,9 +46,8 @@ Plus all [caddy-docker-proxy environment variables](https://github.com/lucaslore
 
 1. Starts caddy-docker-proxy normally
 2. Waits for Caddy admin API to be ready
-3. Spawns three background watchers:
+3. Spawns two background watchers:
    - **Cert watcher**: On certificate change, removes and re-adds the TLS certificate via admin API
-   - **Caddyfile watcher**: On Caddyfile change, runs `caddy reload`
    - **Catch-all watcher**: Polls config and re-injects catch-all if missing
 
 ## Catch-All Custom Domains

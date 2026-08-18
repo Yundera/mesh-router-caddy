@@ -2,8 +2,30 @@
 set -e
 
 CERT_PATH="${CERT_PATH:-/certs/cert.pem}"
-CADDYFILE_PATH="${CADDYFILE_PATH:-/etc/caddy/Caddyfile}"
 CADDY_ADMIN="${CADDY_ADMIN:-localhost:2019}"
+
+# NO CADDYFILE WATCHER HERE — deliberately. caddy-docker-proxy already re-reads
+# the base Caddyfile (--caddyfile-path) on every generation, and it generates
+# every --polling-interval (default 30s) as well as on docker events. A base
+# Caddyfile edit therefore reaches the running config on its own, merged with
+# the container-label routes.
+#
+# This file used to carry a start_caddyfile_watcher that inotify-watched the
+# Caddyfile and ran `caddy reload --config "$CADDYFILE_PATH"`. That reload
+# replaces the WHOLE running config with the base file alone, so every
+# label-derived route disappeared until caddy-docker-proxy's next generation
+# put them back — up to 30s during which every app hostname fell through to the
+# catch-all. Measured on a test PCS: the route array collapsed to 3 entries (the
+# base file's own site blocks) and came back at 31.
+#
+# It was invisible because the deployment bind-mounts the Caddyfile as a SINGLE
+# FILE: that mount is pinned to the inode it started with, and the writer
+# (rsync) renames a new file into place, so the watch never fired and the
+# container never saw an update either. Fixing the mount without deleting this
+# watcher would have turned a dormant bug into a live one.
+#
+# If 30s is ever too slow, lower --polling-interval. Do not reintroduce a
+# `caddy reload` of the base file: it cannot see the labels.
 
 # Catch-all configuration for custom domains
 # These are injected via Admin API because caddy-docker-proxy drops them
@@ -25,15 +47,6 @@ reload_certs() {
         -d '{"certificate":"/certs/cert.pem","key":"/certs/key.pem","tags":["cert0"]}' || true
 
     echo "[watcher] Certificate reloaded"
-}
-
-reload_caddyfile() {
-    echo "[watcher] Caddyfile change detected, reloading..."
-
-    # Use caddy reload command to re-parse Caddyfile
-    caddy reload --config "$CADDYFILE_PATH" --adapter caddyfile --address "$CADDY_ADMIN" 2>&1 || true
-
-    echo "[watcher] Caddyfile reloaded"
 }
 
 wait_for_caddy() {
@@ -305,24 +318,8 @@ start_cert_watcher() {
     fi
 }
 
-start_caddyfile_watcher() {
-    if [ -f "$CADDYFILE_PATH" ]; then
-        echo "[watcher] Watching $CADDYFILE_PATH for changes..."
-        while true; do
-            inotifywait -e modify -e create -e moved_to "$CADDYFILE_PATH" 2>/dev/null || true
-            sleep 1
-            if [ -f "$CADDYFILE_PATH" ]; then
-                reload_caddyfile
-            fi
-        done
-    else
-        echo "[watcher] Caddyfile not found at $CADDYFILE_PATH, caddyfile watcher disabled"
-    fi
-}
-
 # Wait for Caddy, then start watchers in background
 (wait_for_caddy && start_cert_watcher) &
-(wait_for_caddy && start_caddyfile_watcher) &
 (wait_for_caddy && start_catchall_watcher) &
 
 # Run original caddy docker-proxy
