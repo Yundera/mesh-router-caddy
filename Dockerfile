@@ -1,6 +1,6 @@
 FROM lucaslorentz/caddy-docker-proxy:ci-alpine
 
-RUN apk add --no-cache inotify-tools curl
+RUN apk add --no-cache inotify-tools curl jq
 
 COPY Caddyfile /etc/caddy/Caddyfile
 COPY entrypoint.sh /entrypoint.sh

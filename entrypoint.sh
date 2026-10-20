@@ -71,201 +71,97 @@ wait_for_caddy() {
 #   1. TLS connection policy: set cert0 on the catch-all (no SNI match) policy
 #      so unknown domains get the custom CA cert (Cloudflare Full mode)
 #   2. *.sslip.io passthrough TLS policy ordered before the catch-all, so sslip
-#      hosts serve their Let's Encrypt cert instead of cert0 (see
-#      inject_sslip_passthrough_policy for the full rationale)
+#      hosts serve their Let's Encrypt cert instead of cert0
 #   3. HTTP route: append a catch-all route (no host matcher) with
 #      X-Mesh-Catchall marker header for reliable detection
+# See CATCHALL_JQ for the details of each.
 # =============================================================================
 
-has_catchall_tls_conn_policy() {
-    # Check if the catch-all TLS connection policy (no SNI match) has cert0 selected.
-    # Without this, unknown SNI values get an empty {} policy and TLS handshake fails.
-    # Must check the specific catch-all policy, not just any policy in the array.
-    local idx
-    idx=$(find_catchall_tls_conn_policy_index) || return 1
-    local policy
-    policy=$(curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies/${idx}" 2>/dev/null) || return 1
-    echo "$policy" | grep -q '"any_tag"' || return 1
-}
-
-has_sslip_passthrough_policy() {
-    # True if a connection policy explicitly matches *.sslip.io. That policy uses
-    # default (unrestricted) certificate selection so sslip hosts serve their
-    # Let's Encrypt cert, instead of being captured by the cert0 catch-all (which
-    # restricts selection to the gateway CA cert).
-    curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies" 2>/dev/null \
-        | grep -qF '*.sslip.io'
-}
-
-has_catchall_route() {
-    # Check for our tagged catch-all route via the X-Mesh-Catchall marker
-    curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes" 2>/dev/null | \
-        grep -q 'X-Mesh-Catchall'
-}
-
-find_catchall_route_index() {
-    # Iterate routes by index to find the one tagged with our marker
-    local i=0
-    while true; do
-        local route
-        route=$(curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes/${i}" 2>/dev/null) || return 1
-        if echo "$route" | grep -q 'X-Mesh-Catchall'; then
-            echo "$i"
-            return 0
-        fi
-        i=$((i + 1))
-    done
-}
-
-remove_catchall_route() {
-    # Remove existing tagged catch-all route (safety net against duplicates)
-    local idx
-    idx=$(find_catchall_route_index) || return 0
-    echo "[catchall] Removing stale catch-all route at index ${idx}..."
-    curl -sf -X DELETE "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes/${idx}" 2>/dev/null || true
-}
-
-find_catchall_tls_conn_policy_index() {
-    # Find the TLS connection policy without an SNI match (the catch-all).
-    # Iterate policies; the one without "match" or with empty match is the catch-all.
-    local i=0
-    while true; do
-        local policy
-        policy=$(curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies/${i}" 2>/dev/null) || return 1
-        # A catch-all policy has no "match" field (or match is absent)
-        if ! echo "$policy" | grep -q '"match"'; then
-            echo "$i"
-            return 0
-        fi
-        i=$((i + 1))
-    done
-}
-
-inject_catchall_tls_conn_policy() {
-    # Patch the catch-all TLS connection policy to use cert0 (custom CA cert).
-    # Custom domains come through Cloudflare which uses "Full" mode — it doesn't
-    # verify SAN/CN, just needs a valid TLS handshake. Using cert0 avoids ACME
-    # challenges which fail behind Cloudflare's proxy.
-    echo "[catchall] Patching catch-all TLS connection policy with cert0..."
-
-    local idx
-    # `|| idx=""` is load-bearing: find_catchall_tls_conn_policy_index returns 1
-    # whenever no match-less policy exists yet, which is a NORMAL state while
-    # caddy-docker-proxy is mid-regeneration. Under `set -e` a bare failing
-    # assignment aborts the shell immediately, so the guard below never runs and
-    # the watcher dies for good. See start_catchall_watcher for the full history.
-    idx=$(find_catchall_tls_conn_policy_index) || idx=""
-    if [ -z "$idx" ]; then
-        echo "[catchall] WARN: No catch-all TLS connection policy found"
-        return
-    fi
-
-    # Replace the empty {} policy with one that selects cert0
-    curl -sf -X PUT "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies/${idx}" \
-        -H "Content-Type: application/json" \
-        -d '{"certificate_selection": {"any_tag": ["cert0"]}}' \
-        || echo "[catchall] WARN: Failed to patch TLS connection policy"
-
-    echo "[catchall] TLS connection policy patched (index ${idx} → cert0)"
-}
-
-inject_sslip_passthrough_policy() {
-    # Insert a connection policy that matches *.sslip.io with DEFAULT certificate
-    # selection, ordered immediately before the cert0 catch-all.
-    #
-    # Why this is needed: the cert0 catch-all uses `any_tag: cert0`, which
-    # restricts the eligible cert pool to the gateway CA cert. Any *.sslip.io SNI
-    # that falls through to it is served the gateway CA even when its publicly
-    # trusted Let's Encrypt cert is loaded — so the sslip cert never appears to
-    # external clients (and the orchestrator's TLS-validating sslip health check
-    # reports UNABLE_TO_VERIFY_LEAF_SIGNATURE). A policy with no
-    # certificate_selection lets Caddy pick the SNI-matching managed (LE) cert.
-    #
-    # `*.sslip.io` is a single-label wildcard, so one static policy covers both
-    # <app>-<ip>.sslip.io and the bare <ip>.sslip.io without enumerating hosts.
-    # Inserting at the catch-all's index (PUT inserts, shifting it down) keeps the
-    # sslip policy ahead of the catch-all so it wins for sslip SNIs.
-    if has_sslip_passthrough_policy; then
-        return
-    fi
-    local idx
-    # Same errexit trap as in inject_catchall_tls_conn_policy: without `|| idx=""`
-    # a legitimate "not found" return kills the watcher instead of deferring.
-    idx=$(find_catchall_tls_conn_policy_index) || idx=""
-    if [ -z "$idx" ]; then
-        echo "[catchall] WARN: catch-all TLS policy not present yet; deferring sslip passthrough"
-        return
-    fi
-    echo "[catchall] Inserting *.sslip.io passthrough TLS policy at index ${idx} (before catch-all)..."
-    curl -sf -X PUT "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/tls_connection_policies/${idx}" \
-        -H "Content-Type: application/json" \
-        -d '{"match": {"sni": ["*.sslip.io"]}}' \
-        || echo "[catchall] WARN: Failed to insert sslip passthrough policy"
-    echo "[catchall] sslip passthrough policy inserted"
-}
-
-inject_catchall_route() {
-    echo "[catchall] Injecting catch-all HTTP route to ${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}..."
-    curl -sf -X POST "http://${CADDY_ADMIN}/config/apps/http/servers/srv0/routes" \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"handle\": [{
-                \"handler\": \"subroute\",
-                \"routes\": [{
-                    \"handle\": [
-                        {
-                            \"handler\": \"headers\",
-                            \"response\": {
-                                \"set\": {
-                                    \"X-Mesh-Catchall\": [\"true\"]
-                                }
-                            }
-                        },
-                        {
-                            \"handler\": \"reverse_proxy\",
-                            \"upstreams\": [{\"dial\": \"${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}\"}]
-                        }
-                    ]
-                }]
-            }],
-            \"terminal\": true
-        }" || echo "[catchall] WARN: Failed to inject catch-all route"
-    echo "[catchall] HTTP route injected"
-}
+# jq program: srv0 as read -> srv0 with the catch-all config applied. Each step
+# is a no-op when its piece is already present, so an unchanged output means
+# there is nothing to write.
+#   - catch-all policy: the FIRST policy without a "match" (caddy-docker-proxy
+#     leaves an empty {} there). It gets cert0 so unknown SNIs (custom domains
+#     through Cloudflare "Full" mode, which checks no SAN/CN) still handshake,
+#     without ACME challenges that fail behind Cloudflare's proxy.
+#   - *.sslip.io passthrough, inserted right BEFORE that catch-all. The cert0
+#     catch-all uses `any_tag: cert0`, which restricts the eligible pool to the
+#     gateway CA cert, so an sslip SNI falling through to it is served the
+#     gateway CA even when its Let's Encrypt cert is loaded (and the
+#     orchestrator's TLS-validating sslip health check reports
+#     UNABLE_TO_VERIFY_LEAF_SIGNATURE). A policy with no certificate_selection
+#     lets Caddy pick the SNI-matching LE cert; `*.sslip.io` is single-label, so
+#     it covers <app>-<ip>.sslip.io and the bare <ip>.sslip.io alike.
+#   - catch-all HTTP route (no host matcher), appended last and tagged with the
+#     X-Mesh-Catchall response header so it can be recognised.
+# No match-less policy at all is a NORMAL state mid-regeneration: the program
+# then leaves the policies alone and the next tick picks it up.
+CATCHALL_JQ='
+  (.tls_connection_policies // []) as $p
+  | ([$p | to_entries[] | select(.value.match == null) | .key] | first) as $i
+  | if $i == null then . else
+      .tls_connection_policies = (
+        ($p | .[$i] = (if (.[$i].certificate_selection.any_tag // []) | index("cert0")
+                        then .[$i] else {"certificate_selection": {"any_tag": ["cert0"]}} end))
+        | if any(.[]; (.match.sni // []) | index("*.sslip.io"))
+          then . else .[:$i] + [{"match": {"sni": ["*.sslip.io"]}}] + .[$i:] end)
+    end
+  | if (.routes // []) | tostring | contains("X-Mesh-Catchall") then . else
+      .routes = (.routes // []) + [{
+        "handle": [{"handler": "subroute", "routes": [{"handle": [
+          {"handler": "headers", "response": {"set": {"X-Mesh-Catchall": ["true"]}}},
+          {"handler": "reverse_proxy", "upstreams": [{"dial": $dial}]}
+        ]}]}],
+        "terminal": true
+      }]
+    end'
 
 ensure_catchall_config() {
     if [ "$CATCHALL_ENABLED" != "true" ]; then
         return
     fi
 
-    # Wait for srv0 to exist (caddy-docker-proxy creates it)
-    if ! curl -sf "http://${CADDY_ADMIN}/config/apps/http/servers/srv0" > /dev/null 2>&1; then
+    # ONE read per tick, ONE write only when something is missing.
+    #
+    # This used to probe each piece with its own GETs and inject each with its
+    # own PUT/POST: 6+ admin requests every tick, each logged by Caddy at INFO
+    # (~50 MB/day of "received request" in the container log, with no rotation),
+    # and three writes — three full config reloads — after every caddy-docker-
+    # proxy regeneration.
+    #
+    # The write is a PATCH of srv0 guarded by If-Match on the ETag of the read.
+    # caddy-docker-proxy replaces the whole config whenever it regenerates; if
+    # that lands between our read and our write, Caddy answers 412 instead of
+    # letting a stale srv0 (old routes, old upstream IPs) overwrite the new one,
+    # and the next tick starts again from the fresh config.
+    local hdrs body etag desired status
+    hdrs=$(mktemp) || return
+    body=$(curl -sf -D "$hdrs" "http://${CADDY_ADMIN}/config/apps/http/servers/srv0" 2>/dev/null)
+    # srv0 does not exist until caddy-docker-proxy has generated it.
+    if [ -z "$body" ] || [ "$body" = "null" ]; then
+        rm -f "$hdrs"
+        return
+    fi
+    etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' "$hdrs" | tr -d '\r')
+    rm -f "$hdrs"
+
+    desired=$(printf '%s' "$body" | jq -c --arg dial "${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}" "$CATCHALL_JQ") || {
+        echo "[catchall] WARN: could not compute catch-all config"
+        return
+    }
+    if [ "$(printf '%s' "$body" | jq -c .)" = "$desired" ]; then
         return
     fi
 
-    local injected=false
-
-    if ! has_catchall_tls_conn_policy; then
-        inject_catchall_tls_conn_policy
-        injected=true
-    fi
-
-    # Must run after the cert0 catch-all exists: this inserts the *.sslip.io
-    # passthrough policy immediately before it so sslip hosts serve their LE cert.
-    if ! has_sslip_passthrough_policy; then
-        inject_sslip_passthrough_policy
-        injected=true
-    fi
-
-    if ! has_catchall_route; then
-        remove_catchall_route
-        inject_catchall_route
-        injected=true
-    fi
-
-    if [ "$injected" = "true" ]; then
-        echo "[catchall] Config injection complete"
-    fi
+    echo "[catchall] Injecting catch-all config (cert0 policy, *.sslip.io passthrough, route to ${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT})..."
+    status=$(printf '%s' "$desired" | curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+        "http://${CADDY_ADMIN}/config/apps/http/servers/srv0" \
+        -H "Content-Type: application/json" -H "If-Match: ${etag}" --data-binary @-)
+    case "$status" in
+        200) echo "[catchall] Config injection complete" ;;
+        412) echo "[catchall] Config changed underneath (regeneration); retrying next tick" ;;
+        *)   echo "[catchall] WARN: PATCH srv0 failed (HTTP ${status})" ;;
+    esac
 }
 
 start_catchall_watcher() {
@@ -284,13 +180,13 @@ start_catchall_watcher() {
     # fail-fast behaviour untouched.
     #
     # History: with errexit active, one unguarded `idx=$(...)` returning non-zero
-    # killed this loop outright. caddy-docker-proxy then dropped the catch-all on
+    # (no match-less policy mid-regeneration) killed this loop outright. caddy-docker-proxy then dropped the catch-all on
     # the next regeneration with nothing left to re-inject it, and every custom
     # domain on the box failed its TLS handshake (alert 80 -> Cloudflare 525)
     # until someone restarted the container by hand. *.nsl.sh / *.nip.io /
     # *.sslip.io kept working throughout, so the outage was invisible on any box
-    # without a custom domain. Guarding the two assignments fixes that specific
-    # path; `set +e` makes the whole loop non-fatal by construction.
+    # without a custom domain. `set +e` makes the whole loop non-fatal by
+    # construction.
     set +e
 
     # Initial injection

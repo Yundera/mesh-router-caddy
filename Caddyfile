@@ -9,6 +9,11 @@
     log {
         output stdout
         format console
+        # The catch-all watcher in entrypoint.sh reads the admin API every few
+        # seconds, and Caddy logs every admin request at INFO. Unfiltered, that
+        # was most of an unrotated container log growing ~50 MB/day. The
+        # watcher prints its own line whenever it changes anything.
+        exclude admin.api
     }
 
     # Let's Encrypt email for certificate registration (used for sslip.io domains)
