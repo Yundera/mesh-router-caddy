@@ -38,6 +38,19 @@ CADDY_STARTUP_TIMEOUT="${CADDY_STARTUP_TIMEOUT:-60}"
 # e.g. <domain> and *.<domain> once the box holds its DNS-01 wildcard. Written by the
 # template's ensure-dns-delegation self-check; absent = none (today's behaviour).
 TLS_PASSTHROUGH_FILE="${TLS_PASSTHROUGH_FILE:-/data/dns/tls_passthrough}"
+# Names Caddy must obtain itself even though a loaded certificate already covers them
+# (the box root <domain> is covered by cert0's *.<zone>, so automatic HTTPS skips it).
+# Injected as the TLS app's `certificates.automate`. Same writer; absent = none.
+TLS_AUTOMATE_FILE="${TLS_AUTOMATE_FILE:-/data/dns/tls_automate}"
+
+# read_names <file>: a JSON array of the file's non-blank lines, trimmed, sorted.
+read_names() {
+    if [ -s "$1" ]; then
+        jq -Rnc '[inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)] | unique' < "$1" 2>/dev/null || echo '[]'
+    else
+        echo '[]'
+    fi
+}
 
 reload_certs() {
     echo "[watcher] Certificate change detected, reloading..."
@@ -158,10 +171,8 @@ ensure_catchall_config() {
     rm -f "$hdrs"
 
     # The box's own zone: one SNI pattern per line, blank lines ignored.
-    local zone='[]'
-    if [ -s "$TLS_PASSTHROUGH_FILE" ]; then
-        zone=$(jq -Rnc '[inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)] | unique' < "$TLS_PASSTHROUGH_FILE" 2>/dev/null) || zone='[]'
-    fi
+    local zone
+    zone=$(read_names "$TLS_PASSTHROUGH_FILE")
 
     desired=$(printf '%s' "$body" | jq -c --arg dial "${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}" --argjson zone "$zone" "$CATCHALL_JQ") || {
         echo "[catchall] WARN: could not compute catch-all config"
@@ -179,6 +190,36 @@ ensure_catchall_config() {
         200) echo "[catchall] Config injection complete" ;;
         412) echo "[catchall] Config changed underneath (regeneration); retrying next tick" ;;
         *)   echo "[catchall] WARN: PATCH srv0 failed (HTTP ${status})" ;;
+    esac
+}
+
+# Keep TLS_AUTOMATE_FILE's names in apps.tls.certificates.automate. Like the catch-all,
+# caddy-docker-proxy drops it on every regeneration: one read per tick, one guarded
+# write when a name is missing. A removed name goes with the next restart.
+ensure_tls_automate() {
+    local want hdrs body etag desired status
+    want=$(read_names "$TLS_AUTOMATE_FILE")
+    [ "$want" = "[]" ] && return
+    hdrs=$(mktemp) || return
+    body=$(curl -sf -D "$hdrs" "http://${CADDY_ADMIN}/config/apps/tls/certificates" 2>/dev/null)
+    etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' "$hdrs" | tr -d '\r')
+    rm -f "$hdrs"
+    # no tls app yet (mid-regeneration): next tick
+    if [ -z "$body" ] || [ "$body" = "null" ]; then
+        return
+    fi
+    desired=$(printf '%s' "$body" | jq -c --argjson want "$want" '.automate = ((.automate // []) + $want | unique)') || return
+    if [ "$(printf '%s' "$body" | jq -c .)" = "$desired" ]; then
+        return
+    fi
+    echo "[catchall] Automating own certificates for $(printf '%s' "$want" | jq -r 'join(" ")')..."
+    status=$(printf '%s' "$desired" | curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+        "http://${CADDY_ADMIN}/config/apps/tls/certificates" \
+        -H "Content-Type: application/json" -H "If-Match: ${etag}" --data-binary @-)
+    case "$status" in
+        200) ;;
+        412) echo "[catchall] Config changed underneath (regeneration); retrying next tick" ;;
+        *)   echo "[catchall] WARN: PATCH tls certificates failed (HTTP ${status})" ;;
     esac
 }
 
@@ -209,11 +250,13 @@ start_catchall_watcher() {
 
     # Initial injection
     ensure_catchall_config || true
+    ensure_tls_automate || true
 
     # Polling loop to re-inject after caddy-docker-proxy reloads
     while true; do
         sleep "$CATCHALL_CHECK_INTERVAL"
         ensure_catchall_config || true
+        ensure_tls_automate || true
     done
 }
 
