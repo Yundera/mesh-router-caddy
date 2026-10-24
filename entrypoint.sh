@@ -34,6 +34,10 @@ CATCHALL_TARGET_HOST="${DEFAULT_SERVICE_HOST:-casaos}"
 CATCHALL_TARGET_PORT="${DEFAULT_SERVICE_PORT:-8080}"
 CATCHALL_CHECK_INTERVAL="${CATCHALL_CHECK_INTERVAL:-5}"
 CADDY_STARTUP_TIMEOUT="${CADDY_STARTUP_TIMEOUT:-60}"
+# SNI patterns (one per line) served from Caddy's own certificates instead of cert0,
+# e.g. <domain> and *.<domain> once the box holds its DNS-01 wildcard. Written by the
+# template's ensure-dns-delegation self-check; absent = none (today's behaviour).
+TLS_PASSTHROUGH_FILE="${TLS_PASSTHROUGH_FILE:-/data/dns/tls_passthrough}"
 
 reload_certs() {
     echo "[watcher] Certificate change detected, reloading..."
@@ -92,6 +96,9 @@ wait_for_caddy() {
 #     UNABLE_TO_VERIFY_LEAF_SIGNATURE). A policy with no certificate_selection
 #     lets Caddy pick the SNI-matching LE cert; `*.sslip.io` is single-label, so
 #     it covers <app>-<ip>.sslip.io and the bare <ip>.sslip.io alike.
+#   - the box's own zone (TLS_PASSTHROUGH_FILE, $zone): the same kind of policy for
+#     <domain> / *.<domain> once Caddy holds its DNS-01 wildcard, so dot-form names and
+#     the root get that certificate instead of cert0. Empty list = no policy.
 #   - catch-all HTTP route (no host matcher), appended last and tagged with the
 #     X-Mesh-Catchall response header so it can be recognised.
 # No match-less policy at all is a NORMAL state mid-regeneration: the program
@@ -104,7 +111,12 @@ CATCHALL_JQ='
         ($p | .[$i] = (if (.[$i].certificate_selection.any_tag // []) | index("cert0")
                         then .[$i] else {"certificate_selection": {"any_tag": ["cert0"]}} end))
         | if any(.[]; (.match.sni // []) | index("*.sslip.io"))
-          then . else .[:$i] + [{"match": {"sni": ["*.sslip.io"]}}] + .[$i:] end)
+          then . else .[:$i] + [{"match": {"sni": ["*.sslip.io"]}}] + .[$i:] end
+        | if ($zone | length) == 0 or any(.[]; (.match.sni // []) == $zone)
+          then . else
+            ([to_entries[] | select(.value.match == null) | .key] | first) as $j
+            | .[:$j] + [{"match": {"sni": $zone}}] + .[$j:]
+          end)
     end
   | if (.routes // []) | tostring | contains("X-Mesh-Catchall") then . else
       .routes = (.routes // []) + [{
@@ -145,7 +157,13 @@ ensure_catchall_config() {
     etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' "$hdrs" | tr -d '\r')
     rm -f "$hdrs"
 
-    desired=$(printf '%s' "$body" | jq -c --arg dial "${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}" "$CATCHALL_JQ") || {
+    # The box's own zone: one SNI pattern per line, blank lines ignored.
+    local zone='[]'
+    if [ -s "$TLS_PASSTHROUGH_FILE" ]; then
+        zone=$(jq -Rnc '[inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)] | unique' < "$TLS_PASSTHROUGH_FILE" 2>/dev/null) || zone='[]'
+    fi
+
+    desired=$(printf '%s' "$body" | jq -c --arg dial "${CATCHALL_TARGET_HOST}:${CATCHALL_TARGET_PORT}" --argjson zone "$zone" "$CATCHALL_JQ") || {
         echo "[catchall] WARN: could not compute catch-all config"
         return
     }
