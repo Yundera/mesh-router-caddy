@@ -9,6 +9,7 @@ A custom Caddy Docker image extending [caddy-docker-proxy](https://github.com/lu
 - **Catch-all custom domains**: Auto-injects on_demand TLS policy for unknown domains
 - **Zero-downtime**: Uses Caddy admin API for graceful reloads
 - **Docker label routing**: Inherits all caddy-docker-proxy features
+- **DNS-01 via acme-dns**: built with [caddy-dns/acmedns](https://github.com/caddy-dns/acmedns), so a box can get `*.<user>.<zone>` from mesh-router-backend's acme-dns API (`server_url <backend>/router/api/acme-dns`, username = user id, password = the box's route signature). Unused until a Caddyfile has a `dns acmedns` block.
 
 ## Usage
 
@@ -80,6 +81,12 @@ Set `CATCHALL_ENABLED=false` to disable this feature if you don't need custom do
 ```bash
 docker build -t mesh-router-caddy:local .
 ```
+
+Caddy, caddy-docker-proxy and acmedns are pinned in the `Dockerfile` (xcaddy build).
+
+`test/dns01/run.sh` is the DNS-01 end-to-end check: this image's Caddy obtains a wildcard
+and a root cert from Pebble through the backend's acme-dns API and the PowerDNS primary,
+with nothing public (needs the backend's `config/serviceAccount.json` for a throwaway user).
 
 ## Integration with mesh-router-agent
 

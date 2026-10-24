@@ -1,0 +1,68 @@
+# DNS-01 end to end, with nothing public: this image's Caddy gets a wildcard cert from
+# Pebble (a test ACME CA) through mesh-router-backend's acme-dns API, and Pebble
+# validates against the PowerDNS hidden primary the backend writes to.
+# Run with ./run.sh (it creates a throwaway Firestore user and cleans up).
+#
+# Needs: ../../../mesh-router-backend/config/serviceAccount.json (Firestore for the
+# test user, as the backend's own tests use).
+name: caddy-dns01-test
+
+services:
+  pdns:
+    image: ghcr.io/yundera/mesh-router-nameserver:${NAMESERVER_TAG:-a45078f}
+    environment:
+      - ROLE=primary
+      - PDNS_AUTH_API_KEY=testkey
+      - DNS_SOA_NS=ns1.test.example.com
+      - DNS_SECONDARY_IPS=127.0.0.2
+    networks:
+      net:
+        ipv4_address: 172.29.53.10
+
+  redis:
+    image: redis:7-alpine
+    networks: [net]
+
+  backend:
+    build: ../../../mesh-router-backend
+    image: mesh-router-backend:dns01-test
+    environment:
+      - SERVER_DOMAIN=test.example.com
+      - REDIS_URL=redis://redis:6379
+      - PDNS_API_URL=http://pdns:8081
+      - PDNS_API_KEY=testkey
+      - DNS_GATEWAY_IPS=192.0.2.10
+      - DNS_NS_HOSTS=ns1.test.example.com
+    volumes:
+      - ../../../mesh-router-backend/config:/app/config:ro
+    depends_on: [pdns, redis]
+    networks: [net]
+
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:2.9.0
+    command: -config test/config/pebble-config.json -dnsserver 172.29.53.10:53
+    environment:
+      - PEBBLE_VA_NOSLEEP=1
+      - PEBBLE_WFE_NONCEREJECT=0
+    networks: [net]
+
+  caddy:
+    image: ${CADDY_IMAGE:-mesh-router-caddy:acmedns-local}
+    # plain `caddy run`: the module is what is under test, not docker-proxy
+    entrypoint: ["caddy", "run", "--config", "/etc/caddy/Caddyfile.dns01", "--adapter", "caddyfile"]
+    environment:
+      - ACME_USER=${ACME_USER:-}
+      - ACME_KEY=${ACME_KEY:-}
+      - ACME_LABEL=${ACME_LABEL:-}
+    volumes:
+      - ./Caddyfile.dns01:/etc/caddy/Caddyfile.dns01:ro
+      - ./work/pebble.minica.pem:/pebble.minica.pem:ro
+    tmpfs: [/data, /config]
+    depends_on: [backend, pebble]
+    networks: [net]
+
+networks:
+  net:
+    ipam:
+      config:
+        - subnet: 172.29.53.0/24

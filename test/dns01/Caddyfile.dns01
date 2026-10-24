@@ -1,0 +1,21 @@
+{
+	acme_ca https://pebble:14000/dir
+	acme_ca_root /pebble.minica.pem
+	email dns01-test@example.com
+}
+
+# What a delegated box's Caddy will run (template T1/T3): one wildcard + the root,
+# DNS-01 through the backend. resolvers: certmagic finds the zone by an SOA lookup.
+*.{$ACME_LABEL}.test.example.com, {$ACME_LABEL}.test.example.com {
+	tls {
+		dns acmedns {
+			username {$ACME_USER}
+			password {$ACME_KEY}
+			subdomain {$ACME_LABEL}
+			server_url http://backend:8192/acme-dns
+		}
+		resolvers 172.29.53.10:53
+		propagation_timeout -1
+	}
+	respond "dns01 ok {host}"
+}
