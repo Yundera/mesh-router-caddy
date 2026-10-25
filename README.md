@@ -9,7 +9,8 @@ A custom Caddy Docker image extending [caddy-docker-proxy](https://github.com/lu
 - **Catch-all custom domains**: Auto-injects on_demand TLS policy for unknown domains
 - **Zero-downtime**: Uses Caddy admin API for graceful reloads
 - **Docker label routing**: Inherits all caddy-docker-proxy features
-- **DNS-01 via acme-dns**: built with [caddy-dns/acmedns](https://github.com/caddy-dns/acmedns), so a box can get `*.<user>.<zone>` from mesh-router-backend's acme-dns API (`server_url <backend>/router/api/acme-dns`, username = user id, password = the box's route signature). Unused until a Caddyfile has a `dns acmedns` block.
+- **DNS-01 via acme-dns**: built with [caddy-dns/acmedns](https://github.com/caddy-dns/acmedns), so a box can get `*.<user>.<zone>` from mesh-router-backend's acme-dns API (`server_url <backend>/router/api/acme-dns`, username = user id, password = the box's route signature).
+- **Box zone (1.4.0)**: the entrypoint asks the backend whether the box's zone is delegated to the mesh nameservers (`dns.live` in `/resolve/v2`) and writes `/data/mesh-zone.caddy`, which the Caddyfile imports: two snippets, `(zone_root_tls)` for `<domain>` and `(zone_tls)` for the `*.<domain>` site. Not delegated: `import gateway_tls` and `tls internal` (a local wildcard, so Caddy orders nothing for `<app>.<domain>` labels). Delegated: both Let's Encrypt by DNS-01 through acme-dns, plus the root in `certificates.automate` (cert0 covers it, so automatic HTTPS would skip it) and a TLS passthrough for the names whose ACME certificate is in storage. Written before Caddy starts (backend, else last state, else an ACME wildcard in storage), then every `ZONE_CHECK_INTERVAL`; caddy-docker-proxy picks a change up at its next generation. Needs `PROVIDER_STR` and `DOMAIN`; without them the zone stays "not delegated".
 
 ## Usage
 
@@ -40,6 +41,9 @@ services:
 | `DEFAULT_SERVICE_HOST` | `casaos` | Target host for catch-all route |
 | `DEFAULT_SERVICE_PORT` | `8080` | Target port for catch-all route |
 | `CATCHALL_CHECK_INTERVAL` | `5` | Seconds between catch-all config checks |
+| `PROVIDER_STR` | — | Box identity `<backend>,<userid>,<signature>`: asks the backend about the zone, and is the acme-dns credential |
+| `DOMAIN` | — | The box domain (`<user>.<zone>`) |
+| `ZONE_CHECK_INTERVAL` | `120` | Seconds between checks of the zone's delegation |
 
 Plus all [caddy-docker-proxy environment variables](https://github.com/lucaslorentz/caddy-docker-proxy#environment-variables).
 
