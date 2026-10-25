@@ -169,13 +169,29 @@ init_zone() {
     apply_zone "$live"
 }
 
+# A delegated box goes back to the internal wildcard only after ZONE_DOWNGRADE_CHECKS
+# readings in a row say "not delegated": one odd answer (backend restarting, a gap in
+# its cache) must not swap the box's certificates. Becoming delegated applies at once.
+ZONE_DOWNGRADE_CHECKS="${ZONE_DOWNGRADE_CHECKS:-3}"
+
 start_zone_watcher() {
     set +e
+    local live last misses=0
     echo "[zone] Watching the backend's view of ${DOMAIN:-?} every ${ZONE_CHECK_INTERVAL}s"
     while true; do
         sleep "$ZONE_CHECK_INTERVAL"
+        last=$(cat "$ZONE_LAST_STATE" 2>/dev/null)
         live=$(zone_live 10)
-        [ -n "$live" ] || live=$(cat "$ZONE_LAST_STATE" 2>/dev/null)
+        [ -n "$live" ] || live="$last"
+        if [ "$live" = 0 ] && [ "$last" = 1 ]; then
+            misses=$((misses + 1))
+            if [ "$misses" -lt "$ZONE_DOWNGRADE_CHECKS" ]; then
+                echo "[zone] ${DOMAIN:-?}: not delegated per the backend ($misses/$ZONE_DOWNGRADE_CHECKS), keeping the DNS-01 issuer"
+                live=1
+            fi
+        else
+            misses=0
+        fi
         apply_zone "${live:-0}"
     done
 }

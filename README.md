@@ -44,6 +44,7 @@ services:
 | `PROVIDER_STR` | — | Box identity `<backend>,<userid>,<signature>`: asks the backend about the zone, and is the acme-dns credential |
 | `DOMAIN` | — | The box domain (`<user>.<zone>`) |
 | `ZONE_CHECK_INTERVAL` | `120` | Seconds between checks of the zone's delegation |
+| `ZONE_DOWNGRADE_CHECKS` | `3` | Consecutive "not delegated" answers before a delegated box goes back to the internal wildcard (becoming delegated applies at once) |
 
 Plus all [caddy-docker-proxy environment variables](https://github.com/lucaslorentz/caddy-docker-proxy#environment-variables).
 
