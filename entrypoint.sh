@@ -169,6 +169,52 @@ init_zone() {
     apply_zone "$live"
 }
 
+# =============================================================================
+# CAA: only this box's ACME accounts may obtain certificates for its zone
+# =============================================================================
+# While the zone is delegated, the Let's Encrypt account URIs in Caddy's storage (one per
+# email the box ever used) are reported to the backend, which publishes them as the zone's
+# CAA (issue + issuewild "letsencrypt.org; accounturi=..."). Reported when the list
+# changes, and once a day in case the backend lost it; never an empty list (removing the
+# CAA is deliberate: PUT /dns/v1/caa with []). A rebuilt box creates a new account
+# at its first order, which the old CAA refuses: the next watcher tick reports the new
+# account and Caddy's retry goes through.
+ACME_STORAGE="${ACME_STORAGE:-/data/caddy/acme}"
+CAA_LAST_REPORT="${CAA_LAST_REPORT:-/data/mesh-caa.state}"
+
+# acme_accounts: a JSON array of the valid Let's Encrypt account URIs in storage.
+acme_accounts() {
+    local f
+    for f in "$ACME_STORAGE"/acme-v02.api.letsencrypt.org-directory/users/*/*.json \
+             "$ACME_STORAGE"/acme-staging-v02.api.letsencrypt.org-directory/users/*/*.json; do
+        [ -s "$f" ] && jq -r 'select(.status == "valid") | .location // empty' "$f" 2>/dev/null
+    done | jq -Rnc '[inputs | select(length > 0)] | unique'
+}
+
+report_caa() {
+    local backend user sig accounts status
+    [ -n "${PROVIDER_STR:-}" ] || return 0
+    accounts=$(acme_accounts) || return 0
+    # No account yet (fresh storage, rebuilt box): keep the published CAA. Reporting []
+    # would remove it, and with it the restriction, until the first order.
+    [ "$accounts" = "[]" ] && return 0
+    if [ "$accounts" = "$(cat "$CAA_LAST_REPORT" 2>/dev/null)" ] \
+        && [ -n "$(find "$CAA_LAST_REPORT" -mmin -1440 2>/dev/null)" ]; then
+        return 0
+    fi
+    backend="${PROVIDER_STR%%,*}"
+    user="${PROVIDER_STR#*,}"; user="${user%%,*}"
+    sig="${PROVIDER_STR##*,}"
+    status=$(printf '{"accounts":%s}' "$accounts" | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X PUT \
+        "${backend%/}/router/api/dns/v1/caa/${user}/${sig}" -H "Content-Type: application/json" --data-binary @-)
+    if [ "$status" = 200 ]; then
+        echo "$accounts" >"$CAA_LAST_REPORT"
+        echo "[caa] ${DOMAIN:-?}: reported ACME accounts $(printf '%s' "$accounts" | jq -r 'join(" ")')"
+    else
+        echo "[caa] WARN: reporting ACME accounts failed (HTTP ${status:-?}), retrying next tick"
+    fi
+}
+
 # A delegated box goes back to the internal wildcard only after ZONE_DOWNGRADE_CHECKS
 # readings in a row say "not delegated": one odd answer (backend restarting, a gap in
 # its cache) must not swap the box's certificates. Becoming delegated applies at once.
@@ -178,6 +224,7 @@ start_zone_watcher() {
     set +e
     local live last misses=0
     echo "[zone] Watching the backend's view of ${DOMAIN:-?} every ${ZONE_CHECK_INTERVAL}s"
+    [ "$(cat "$ZONE_LAST_STATE" 2>/dev/null)" = 1 ] && report_caa
     while true; do
         sleep "$ZONE_CHECK_INTERVAL"
         last=$(cat "$ZONE_LAST_STATE" 2>/dev/null)
@@ -193,6 +240,7 @@ start_zone_watcher() {
             misses=0
         fi
         apply_zone "${live:-0}"
+        [ "$live" = 1 ] && report_caa
     done
 }
 
