@@ -11,6 +11,7 @@ A custom Caddy Docker image extending [caddy-docker-proxy](https://github.com/lu
 - **Docker label routing**: Inherits all caddy-docker-proxy features
 - **DNS-01 via acme-dns**: built with [caddy-dns/acmedns](https://github.com/caddy-dns/acmedns), so a box can get `*.<user>.<zone>` from mesh-router-backend's acme-dns API (`server_url <backend>/router/api/acme-dns`, username = user id, password = the box's route signature).
 - **Box zone (1.4.0)**: the entrypoint asks the backend whether the box's zone is delegated to the mesh nameservers (`dns.live` in `/resolve/v2`) and writes `/data/mesh-zone.caddy`, which the Caddyfile imports: two snippets, `(zone_root_tls)` for `<domain>` and `(zone_tls)` for the `*.<domain>` site. Not delegated: `import gateway_tls` and `tls internal` (a local wildcard, so Caddy orders nothing for `<app>.<domain>` labels). Delegated: both Let's Encrypt by DNS-01 through acme-dns, plus the root in `certificates.automate` (cert0 covers it, so automatic HTTPS would skip it) and a TLS passthrough for the names whose ACME certificate is in storage. Written before Caddy starts (backend, else last state, else an ACME wildcard in storage), then every `ZONE_CHECK_INTERVAL`; caddy-docker-proxy picks a change up at its next generation. Needs `PROVIDER_STR` and `DOMAIN`; without them the zone stays "not delegated".
+- **PROXY protocol from the gateways**: the entrypoint writes `/data/mesh-proxy.caddy`, a `servers :443` block that the Caddyfile's global options import by glob (`import /data/mesh-proxy*.caddy`): the `proxy_protocol` listener wrapper with `allow` = the backend's `gatewayIps` (`/router/api/version`) + the tunnel container's address, `fallback_policy ignore`, and the same list as `trusted_proxies`. A gateway passing a connection through raw then hands over the client's address; a header from anyone else is ignored. The box reports to the backend (`PUT /router/api/hop/v1/proxy-protocol/<user>/<sig>`) whether its running config carries the wrapper, and gateways send the header only to boxes that said yes. No gateway list from the backend = no wrapper.
 
 ## Usage
 
@@ -45,6 +46,8 @@ services:
 | `DOMAIN` | — | The box domain (`<user>.<zone>`) |
 | `ZONE_CHECK_INTERVAL` | `120` | Seconds between checks of the zone's delegation |
 | `ZONE_DOWNGRADE_CHECKS` | `3` | Consecutive "not delegated" answers before a delegated box goes back to the internal wildcard (becoming delegated applies at once) |
+| `TUNNEL_HOST` | `mesh-router-tunnel` | Name of the tunnel container, whose address joins the PROXY allow list |
+| `PROXY_REPORT_MINUTES` | `30` | Minutes between re-reports of the PROXY capability to the backend (it forgets one after 2 h) |
 
 Plus all [caddy-docker-proxy environment variables](https://github.com/lucaslorentz/caddy-docker-proxy#environment-variables).
 

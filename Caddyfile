@@ -18,6 +18,14 @@
 
     # Let's Encrypt email for certificate registration (used for sslip.io domains)
     email {$PCS_EMAIL}
+
+    # PROXY v2 from the gateways (client address on passthrough) and their
+    # X-Forwarded-For on terminated requests: a `servers :443` block that
+    # mesh-router-caddy's entrypoint writes from the backend's gateway list
+    # (PROXY PROTOCOL in its entrypoint.sh). A glob, so an image that does not
+    # write the file yet only logs a warning: caddy-docker-proxy drops a block
+    # whose plain import is missing.
+    import /data/mesh-proxy*.caddy
 }
 
 # Custom CA TLS for gateway-routed and ip.<zone> (IP_ZONE) domains
