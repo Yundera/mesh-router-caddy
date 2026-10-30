@@ -14,6 +14,8 @@
         # was most of an unrotated container log growing ~50 MB/day. The
         # watcher prints its own line whenever it changes anything.
         exclude admin.api
+        # The access log goes only to the `usage` logger (entrypoint, USAGE).
+        exclude http.log.access
     }
 
     # Let's Encrypt email for certificate registration (used for sslip.io domains)
@@ -26,6 +28,10 @@
     # write the file yet only logs a warning: caddy-docker-proxy drops a block
     # whose plain import is missing.
     import /data/mesh-proxy*.caddy
+
+    # The `usage` logger: access log to mesh-router-agent while MESH_USAGE_REPORT=on
+    # (entrypoint, USAGE). A glob, so "off" (no file) is only a warning.
+    import /data/mesh-usage*.caddy
 }
 
 # Custom CA TLS for gateway-routed and ip.<zone> (IP_ZONE) domains

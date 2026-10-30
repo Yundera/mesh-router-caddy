@@ -48,6 +48,8 @@ services:
 | `ZONE_DOWNGRADE_CHECKS` | `3` | Consecutive "not delegated" answers before a delegated box goes back to the internal wildcard (becoming delegated applies at once) |
 | `TUNNEL_HOST` | `mesh-router-tunnel` | Name of the tunnel container, whose address joins the PROXY allow list |
 | `PROXY_REPORT_MINUTES` | `30` | Minutes between re-reports of the PROXY capability to the backend (it forgets one after 2 h) |
+| `MESH_USAGE_REPORT` | `on` | Usage (DAU) reporting: `on` turns the access log on (all sites, via the catch-all watcher) and streams it to mesh-router-agent; `off` = no access log. The Caddyfile must `import /data/mesh-usage*.caddy` in its global options and `exclude http.log.access` from its default logger |
+| `USAGE_TARGET` | `udp/mesh-router-agent:5140` | Where the access log goes. UDP on purpose: undeliverable entries are lost instead of dumped to stderr |
 
 Plus all [caddy-docker-proxy environment variables](https://github.com/lucaslorentz/caddy-docker-proxy#environment-variables).
 
@@ -57,7 +59,7 @@ Plus all [caddy-docker-proxy environment variables](https://github.com/lucaslore
 2. Waits for Caddy admin API to be ready
 3. Spawns two background watchers:
    - **Cert watcher**: On certificate change, removes and re-adds the TLS certificate via admin API
-   - **Catch-all watcher**: Polls config and re-injects catch-all if missing
+   - **Catch-all watcher**: Polls config and re-injects catch-all (and, with usage reporting on, the access log) if missing
 
 ## Catch-All Custom Domains
 
